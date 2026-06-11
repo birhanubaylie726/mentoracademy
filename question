@@ -1,0 +1,313 @@
+<?php
+require_once './db.php';
+require_once './auth.php';
+verifyAccess(['teacher']);
+
+$teacher_id = $_SESSION['user_id'];
+$success_msg = '';
+$error_msg = '';
+
+// ==========================================
+// 📥 EXAM CONTROL SUITE SYSTEM CONTROLLER
+// ==========================================
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    $action = $_POST['action'];
+
+    // 1. ACTION: GENERATE NEW EXAM STRUCTURE
+    if ($action === 'create_exam') {
+        $title       = trim($_POST['title']);
+        $subject_id  = intval($_POST['subject_id']);
+        $duration    = intval($_POST['duration']);
+        $is_active   = isset($_POST['is_active']) ? 1 : 0;
+
+        if (!empty($title) && $subject_id > 0 && $duration > 0) {
+            try {
+                $stmt = $pdo->prepare("INSERT INTO exams (title, subject_id, duration, is_active, created_by) VALUES (?, ?, ?, ?, ?)");
+                $stmt->execute([$title, $subject_id, $duration, $is_active, $teacher_id]);
+                $success_msg = "🎉 Success: New assessment blueprint has been generated and compiled.";
+            } catch (PDOException $e) { $error_msg = "🚨 Generation Failure: " . $e->getMessage(); }
+        } else { $error_msg = "⚠️ Input Blocked: Please complete all parameter fields accurately."; }
+    }
+
+    // 2. ACTION: UPDATE EXISTING EXAM BLUEPRINT
+    if ($action === 'update_exam') {
+        $exam_id     = intval($_POST['exam_id']);
+        $title       = trim($_POST['title']);
+        $subject_id  = intval($_POST['subject_id']);
+        $duration    = intval($_POST['duration']);
+        $is_active   = isset($_POST['is_active']) ? 1 : 0;
+
+        if ($exam_id > 0 && !empty($title) && $subject_id > 0 && $duration > 0) {
+            try {
+                $stmt = $pdo->prepare("UPDATE exams SET title = ?, subject_id = ?, duration = ?, is_active = ? WHERE id = ? AND created_by = ?");
+                $stmt->execute([$title, $subject_id, $duration, $is_active, $exam_id, $teacher_id]);
+                
+                header("Location: create_exam.php?success=" . urlencode("💾 Changes Saved: Blueprint configurations successfully updated."));
+                exit();
+            } catch (PDOException $e) { $error_msg = "🚨 Update Failure: " . $e->getMessage(); }
+        }
+    }
+
+    // 3. ACTION: TOGGLE ACTIVE VISIBILITY / APPROVAL STATUS
+    if ($action === 'toggle_status') {
+        $exam_id = intval($_POST['exam_id']);
+        try {
+            $stmt = $pdo->prepare("UPDATE exams SET is_active = NOT is_active WHERE id = ? AND created_by = ?");
+            $stmt->execute([$exam_id, $teacher_id]);
+            $success_msg = "🔄 Visibility Changed: Exam route visibility configuration modified.";
+        } catch (PDOException $e) { $error_msg = "🚨 Status Toggle Failure: " . $e->getMessage(); }
+    }
+
+    // 4. ACTION: PURGE QUESTIONS INSIDE TARGET EXAM
+    if ($action === 'clear_exam_questions') {
+        $exam_id = intval($_POST['exam_id']);
+        try {
+            $stmt = $pdo->prepare("DELETE FROM questions WHERE exam_id = ?");
+            $stmt->execute([$exam_id]);
+            $success_msg = "💥 Question Purge Complete: All MCQ elements dropped from selected exam.";
+        } catch (PDOException $e) { $error_msg = "🚨 Purge Failure: " . $e->getMessage(); }
+    }
+
+    // 5. ACTION: DELETE ENTIRE EXAM BLUEPRINT STRUCTURE
+    if ($action === 'delete_exam') {
+        $exam_id = intval($_POST['exam_id']);
+        try {
+            $pdo->beginTransaction();
+            // Drop dependent questions first to avoid foreign constraint collisions
+            $drop_q = $pdo->prepare("DELETE FROM questions WHERE exam_id = ?");
+            $drop_q->execute([$exam_id]);
+            
+            $drop_e = $pdo->prepare("DELETE FROM exams WHERE id = ? AND created_by = ?");
+            $drop_e->execute([$exam_id, $teacher_id]);
+            
+            $pdo->commit();
+            $success_msg = "🗑️ Blueprint Dropped: Exam and all its questions permanently removed.";
+        } catch (PDOException $e) { 
+            $pdo->rollBack();
+            $error_msg = "🚨 Deletion Failure: " . $e->getMessage(); 
+        }
+    }
+}
+
+// Check for redirect notification variables
+if (isset($_GET['success'])) { $success_msg = htmlspecialchars($_GET['success']); }
+
+// --- LIVE EDIT COMPILER SELECTION PARSER ---
+$edit_mode = false;
+$edit_exam = [];
+if (isset($_GET['edit_id'])) {
+    $edit_id = intval($_GET['edit_id']);
+    $edit_stmt = $pdo->prepare("SELECT * FROM exams WHERE id = ? AND created_by = ?");
+    $edit_stmt->execute([$edit_id, $teacher_id]);
+    $edit_exam = $edit_stmt->fetch();
+    if ($edit_exam) { $edit_mode = true; }
+}
+
+// Fetch all available subjects for the dropdown select element
+$subjects = $pdo->query("SELECT id, subject_name FROM subjects ORDER BY subject_name ASC")->fetchAll();
+
+// Fetch existing exams built by this instructor to populate the spreadsheet panel ledger
+$my_exams_stmt = $pdo->prepare("
+    SELECT e.*, s.subject_name, COUNT(q.id) AS total_questions 
+    FROM exams e
+    LEFT JOIN subjects s ON e.subject_id = s.id
+    LEFT JOIN questions q ON e.id = q.exam_id
+    WHERE e.created_by = ?
+    GROUP BY e.id
+    ORDER BY e.id DESC
+");
+$my_exams_stmt->execute([$teacher_id]);
+$exams_ledger = $my_exams_stmt->fetchAll();
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Assessment Blueprint Setup - Faculty Portal</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8fafc; }
+        .sidebar { min-width: 260px; max-width: 260px; background: #1e3a8a; min-height: 100vh; color: #fff; }
+        .sidebar .nav-link { color: #bfdbfe; font-weight: 500; }
+        .sidebar .nav-link:hover, .sidebar .nav-link.active { color: #fff; background: #1d4ed8; border-radius: 6px; }
+        .form-card { border-radius: 12px; border: none; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
+        .edit-pulse { border: 2px dashed #0d6efd !important; background-color: #f0f7ff; }
+    </style>
+</head>
+<body>
+<div class="d-flex">
+    <!-- Sidebar Navigation Controls matches rr.PNG -->
+    <div class="sidebar p-3 d-flex flex-column">
+        <h4 class="text-center py-3 border-bottom border-primary mb-4 fw-bold">Faculty Portal</h4>
+        <ul class="nav nav-pills flex-column mb-auto gap-1">
+            <li><a href="teacher_dashboard.php" class="nav-link"><i class="bi bi-house-door me-2"></i> Overview Desk</a></li>
+            <li><a href="create_exam.php" class="nav-link active"><i class="bi bi-file-earmark-plus me-2"></i> Create Exam</a></li>
+            <li><a href="add_questions.php" class="nav-link"><i class="bi bi-patch-question me-2"></i> Question Injector</a></li>
+            <li><a href="view_student_results.php" class="nav-link"><i class="bi bi-journal-text me-2"></i> Student Results</a></li>
+        </ul>
+        <hr class="border-primary">
+        <a href="./logout.php" class="btn btn-danger w-100 fw-bold"><i class="bi bi-box-arrow-left me-2"></i> Logout</a>
+    </div>
+
+    <!-- Main Content Workspace Module View Frame -->
+    <div class="w-100">
+        <nav class="navbar navbar-expand navbar-white bg-white border-bottom px-4 py-3 sticky-top">
+            <span class="navbar-brand mb-0 h5 text-dark fw-bold">Assessment Blueprint Setup</span>
+        </nav>
+
+        <div class="container-fluid p-4" style="max-width: 1200px;">
+            <?php if($success_msg): ?> <div class="alert alert-success alert-dismissible fade show"><?= $success_msg ?><button type="button" class="btn-close" data-bs-dismiss="alert"></button></div> <?php endif; ?>
+            <?php if($error_msg): ?> <div class="alert alert-danger alert-dismissible fade show"><?= $error_msg ?><button type="button" class="btn-close" data-bs-dismiss="alert"></button></div> <?php endif; ?>
+
+            <!-- Blueprint Configuration Box Form matching layout elements inside rr.PNG -->
+            <div class="card form-card p-4 mb-5 bg-white <?= $edit_mode ? 'edit-pulse' : '' ?>">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold text-dark mb-0">
+                        <i class="bi <?= $edit_mode ? 'bi-pencil-square text-primary' : 'bi-plus-square-fill text-primary' ?> me-2"></i>
+                        <?= $edit_mode ? 'Modify Evaluation Parameters' : 'Configure Evaluation Parameters' ?>
+                    </h5>
+                    <?php if($edit_mode): ?>
+                        <a href="create_exam.php" class="btn btn-sm btn-outline-secondary">Discard Changes</a>
+                    <?php endif; ?>
+                </div>
+
+                <form action="" method="POST">
+                    <input type="hidden" name="action" value="<?= $edit_mode ? 'update_exam' : 'create_exam' ?>">
+                    <?php if($edit_mode): ?>
+                        <input type="hidden" name="exam_id" value="<?= $edit_exam['id'] ?>">
+                    <?php endif; ?>
+
+                    <div class="mb-3">
+                        <label class="form-label small fw-bold text-secondary">Examination Title / Session Name</label>
+                        <input type="text" name="title" class="form-control" required placeholder="e.g., Mid-Term Information Technology Evaluation" value="<?= $edit_mode ? htmlspecialchars($edit_exam['title']) : '' ?>">
+                    </div>
+
+                    <div class="row g-3 mb-4">
+                        <div class="col-md-6">
+                            <label class="form-label small fw-bold text-secondary">Linked Academic Discipline</label>
+                            <select name="subject_id" class="form-select" required>
+                                <option value="">-- Select Subject Field --</option>
+                                <?php foreach($subjects as $sub): ?>
+                                    <option value="<?= $sub['id'] ?>" <?= ($edit_mode && $edit_exam['subject_id'] == $sub['id']) ? 'selected' : '' ?>>
+                                        <?= htmlspecialchars($sub['subject_name']) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label small fw-bold text-secondary">Allocated Duration (Minutes)</label>
+                            <input type="number" name="duration" class="form-control" required placeholder="e.g., 60" min="1" value="<?= $edit_mode ? intval($edit_exam['duration']) : '' ?>">
+                        </div>
+                    </div>
+
+                    <!-- Visibility Toggle Check Switch Node mapping structure from rr.PNG -->
+                    <div class="card bg-light border-0 p-3 mb-4">
+                        <div class="form-check form-switch m-0 d-flex align-items-center gap-2">
+                            <input class="form-check-input" type="checkbox" role="switch" id="is_active" name="is_active" value="1" <?= (!$edit_mode || (isset($edit_exam['is_active']) && $edit_exam['is_active'] == 1)) ? 'checked' : '' ?>>
+                            <label class="form-check-label fw-semibold text-dark ps-1" style="cursor:pointer;" for="is_active">Instantly deploy live visibility status for student terminal routing</label>
+                        </div>
+                    </div>
+
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary fw-bold px-4">
+                            <?= $edit_mode ? 'Save Setup Configurations' : 'Generate Exam Structure' ?>
+                        </button>
+                        <a href="teacher_dashboard.php" class="btn btn-outline-secondary px-4">Return to Desk</a>
+                    </div>
+                </form>
+            </div>
+
+            <!-- EXAM LIST LEDGER PANEL -->
+            <div class="card form-card p-4 bg-white">
+                <h5 class="fw-bold text-dark mb-4"><i class="bi bi-collection-play me-2 text-secondary"></i>Existing Examination Blueprints Ledger</h5>
+                
+                <?php if(empty($exams_ledger)): ?>
+                    <div class="text-center text-muted py-5">
+                        <i class="bi bi-folder-x fs-1 text-black-50 d-block mb-2"></i>
+                        No assessment matrices found under your profile identity.
+                    </div>
+                <?php else: ?>
+                    <div class="table-responsive">
+                        <table class="table table-hover align-middle border-top">
+                            <thead class="table-light text-secondary small text-uppercase">
+                                <tr>
+                                    <th style="width: 40%;">Exam Details</th>
+                                    <th>Discipline</th>
+                                    <th>Duration</th>
+                                    <th>Questions Pool</th>
+                                    <th>Status</th>
+                                    <th class="text-end" style="width: 25%;">Control Toolkit Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach($exams_ledger as $row): 
+                                    $is_live = (int)$row['is_active'] === 1;
+                                ?>
+                                    <tr>
+                                        <td>
+                                            <span class="d-block fw-bold text-dark"><?= htmlspecialchars($row['title']) ?></span>
+                                            <small class="text-muted text-uppercase font-monospace small">ID Ref: #<?= $row['id'] ?></small>
+                                        </td>
+                                        <td><span class="badge bg-light text-dark border px-2 py-1"><?= htmlspecialchars($row['subject_name'] ?: 'Unassigned') ?></span></td>
+                                        <td class="font-monospace text-secondary"><?= $row['duration'] ?> Mins</td>
+                                        <td>
+                                            <a href="add_questions.php?exam_id=<?= $row['id'] ?>" class="badge bg-primary text-decoration-none px-3 py-2" title="Manage Question Pool Items">
+                                                <i class="bi bi-patch-question me-1"></i> <?= $row['total_questions'] ?> items
+                                            </a>
+                                        </td>
+                                        <td>
+                                            <form action="" method="POST" class="m-0">
+                                                <input type="hidden" name="action" value="toggle_status">
+                                                <input type="hidden" name="exam_id" value="<?= $row['id'] ?>">
+                                                <button type="submit" class="btn p-0 border-0 align-baseline" title="Toggle Blueprint Routing Live Switch">
+                                                    <?php if($is_live): ?>
+                                                        <span class="badge bg-success-subtle text-success border border-success-subtle px-2 py-1"><i class="bi bi-eye-fill me-1"></i> Approved / Live</span>
+                                                    <?php else: ?>
+                                                        <span class="badge bg-warning-subtle text-warning border border-warning-subtle px-2 py-1"><i class="bi bi-eye-slash-fill me-1"></i> Hidden / Draft</span>
+                                                    <?php endif; ?>
+                                                </button>
+                                            </form>
+                                        </td>
+                                        <td class="text-end">
+                                            <div class="d-flex justify-content-end gap-1">
+                                                <!-- Edit Blueprint Config Link -->
+                                                <a href="create_exam.php?edit_id=<?= $row['id'] ?>" class="btn btn-sm btn-outline-primary fw-bold px-2 py-1" title="Modify Configuration Variables">
+                                                    <i class="bi bi-pencil-square"></i> Edit
+                                                </a>
+
+                                                <!-- Clear Questions Action -->
+                                                <form action="" method="POST" class="m-0" onsubmit="return confirm('⚠️ Danger: This will empty out all MCQs linked inside this exam profile container. Proceed?');">
+                                                    <input type="hidden" name="action" value="clear_exam_questions">
+                                                    <input type="hidden" name="exam_id" value="<?= $row['id'] ?>">
+                                                    <button type="submit" class="btn btn-sm btn-outline-warning fw-bold px-2 py-1" title="Purge Sub-Question Elements">
+                                                        <i class="bi bi-x-octagon"></i> Clear Qs
+                                                    </button>
+                                                </form>
+
+                                                <!-- Drop Exam Entirely Action -->
+                                                <form action="" method="POST" class="m-0" onsubmit="return confirm('🚨 CRITICAL DECISION: This drops the exam matrix and all its content files completely. Proceed?');">
+                                                    <input type="hidden" name="action" value="delete_exam">
+                                                    <input type="hidden" name="exam_id" value="<?= $row['id'] ?>">
+                                                    <button type="submit" class="btn btn-sm btn-danger text-white fw-bold px-2 py-1" title="Destroy Complete Exam Matrix Row">
+                                                        <i class="bi bi-trash3"></i> Delete
+                                                    </button>
+                                                </form>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
